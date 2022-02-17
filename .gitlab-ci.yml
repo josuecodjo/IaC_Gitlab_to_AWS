@@ -1,0 +1,154 @@
+stages:
+  - .pre
+  - publish
+  - plan
+  - deploy
+  - destroy
+
+variables:
+  STACK_NAME: josh-test
+  BUCKET_NAME: josh-test-s3
+  REGION: us-east-1
+
+
+# run on branch push, but not tags
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+
+validate:
+  stage: .pre
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - echo "Validating template for ${STACK_NAME}"
+    - cd cfn
+    - ./check_temp.sh
+
+checkstack:
+  stage: .pre
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - echo "Checking if ${STACK_NAME} exists"
+    - export STACKEXISTS=true
+    - aws cloudformation describe-stacks | grep $STACK_NAME || export STACKEXISTS=false
+    - echo "Stack exists? $STACKEXISTS"
+    - echo "STACKEXISTS=${STACKEXISTS}" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+push_to_s3:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'deploy-stack'
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - aws s3api create-bucket --bucket ${BUCKET_NAME} --region $REGION || echo "Bucket exists"
+    - echo "Publishing template to ${S3URI}"
+    - aws s3 sync cfn/templates/ s3://${BUCKET_NAME}
+  artifacts:
+    reports:
+      dotenv: build.env
+
+plan:
+  stage: plan
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'deploy-stack'
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - export CHANGESETNAME="${STACK_NAME}-${CI_COMMIT_BRANCH}-${BUILD_DATE}"
+    - export S3URI="https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/master.yaml"
+    - echo "STACKEXISTS=${STACKEXISTS}" > build.env
+    - echo "CHANGESETNAME=${CHANGESETNAME}" >> build.env
+    - echo "BUILD_DATE=${BUILD_DATE}" >> build.env
+    - echo "S3URI=${S3URI}" >> build.env
+    - >
+      if [ "$STACKEXISTS" == "true" ]; then
+        CHANGESETID=$(aws cloudformation create-change-set \
+        --stack-name $STACK_NAME \
+        --change-set-name $CHANGESETNAME \
+        --template-url $S3URI \
+        --parameters ParameterKey=VpcName,ParameterValue=$CI_COMMIT_BRANCH \
+        --query 'Id') 
+        echo $CHANGESETID
+        aws cloudformation describe-change-set \
+        --change-set-name $CHANGESETNAME \
+        --stack-name $STACK_NAME
+      else
+        echo "${STACK_NAME} does not exist, need to create it..."
+      fi  
+  dependencies:
+    - push_to_s3
+  artifacts:
+    reports:
+      dotenv: build.env
+
+
+.deployInfra:
+  stage: deploy
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'develop' || $CI_COMMIT_BRANCH == 'deploy-stack'
+      when: manual
+  script:
+    - >
+      if [ "$STACKEXISTS" == "true" ]; then
+        echo "Applying ${CHANGESETNAME}" &&
+        aws cloudformation execute-change-set \
+        --change-set-name $CHANGESETNAME \
+        --stack-name $STACK_NAME-$Stage
+      else
+        echo "Creating ${STACK_NAME} for $Stage" &&
+        aws cloudformation create-stack  \
+          --stack-name $STACK_NAME-$Stage  \
+          --template-body file://cfn/templates/master.yaml \
+          --parameters ParameterKey=VpcName,ParameterValue=$Stage || echo "stack exists"
+      fi 
+    - echo "Well done :-)"
+
+
+deployInfraStaging:
+  extends: .deployInfra
+  variables:
+    Stage: stage
+  resource_group: staging
+
+deployInfraProduction:
+  extends: .deployInfra
+  variables:
+    Stage: prod
+  resource_group: production
+
+
+.destroyInfra:
+  stage: destroy
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main' || $CI_COMMIT_BRANCH == 'develop' || $CI_COMMIT_BRANCH == 'deploy-stack'
+      when: manual
+  script:
+    - >
+      if [ "$STACKEXISTS" == "true" ]; then
+        echo "Applying ${CHANGESETNAME}" &&
+        aws cloudformation execute-change-set \
+        --change-set-name $CHANGESETNAME \
+        --stack-name $STACK_NAME-$Stage
+      else
+        echo "Deleting ${STACK_NAME} for $Stage" &&
+        aws cloudformation delete-stack  \
+          --stack-name $STACK_NAME-$Stage || echo "stack already deleted"
+      fi 
+    - echo "Well done :-)"
+
+destroyInfraStaging:
+  extends: .destroyInfra
+  variables:
+    Stage: stage
+  resource_group: staging
+
+destroyInfraProduction:
+  extends: .destroyInfra
+  variables:
+    Stage: prod
+  resource_group: production
